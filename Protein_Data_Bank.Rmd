@@ -1,0 +1,241 @@
+---
+title: "Protein Data Bank - analiza danych"
+author: "Klaudia Kwiatkowska"
+date: '`r format(Sys.Date(), "%d %B %Y")`'
+output: 
+  html_document:
+    toc: true
+---
+
+# Streszczenie
+
+Raport zawiera analizê danych krystograficznych pochodz¹cych z bazy Protein Data Bank (PDB). Ze wzglêdu na brak danych w niektórych rekordach, nale¿a³o je odpowiednio uzupe³niæ b¹dŸ niekiedy pomin¹æ. Analizowany zbiór danych sk³ada siê z wielu atrybutów, wiêc na potrzeby poszczególnych analiz wymagane by³o staranne dobranie odpowiedniego zakresu danych. W raporcie zdefiniowano znaczenie poszczególnych zmiennych oraz sprawdzono korelacjê miêdzy atrybutami. W ostatniej czêœci projektu nale¿a³o zbudowaæ model regresji oraz stworzyæ klasyfikator przewiduj¹cy wartoœæ atrybutu res_name.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library, include=FALSE}
+library(data.table)
+library(dplyr)
+library(corrplot)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(plotly)
+library(caret)
+library(e1071)
+```
+
+```{r setseed, echo=FALSE}
+set.seed(23)
+```
+
+```{r import, cache=FALSE, include=FALSE}
+protein <- fread("all_summary.csv")
+protein <- filter(protein, res_name != "UNK|UNX|UNL|DUM|N|BLOB|ALA|ARG|ASN|ASP|CYS|GLN|GLU|GLY|HIS|ILE|LEU|LYS|MET|MSE|PHE|PRO|SEC|SER|THR|TRP|TYR|VAL|DA|DG|DT|DC|DU|A|G|T|C|U|HOH|H20|WAT")
+```
+
+# Wstêp
+
+Przedmiotem niniejszego raportu s¹ dane pochodz¹ce z bazy Protein Data Bank. W bazie PDB przechowywane s¹ dane strukturalne bia³ek oraz innych zwi¹zków chemicznych. Dokument ma na celu analizê tych danych oraz ocenê mo¿liwoœci wykorzystania uczenia maszynowego do automatycznego podpowiadania biologom jakie cz¹steczki mog¹ siê kryæ w niewymodelowanych fragmentach map intensywnoœci.
+
+# W³aœciwoœci zbioru
+
+Zbiór sk³ada siê z `r nrow(protein)` obserwacji oraz `r ncol(protein)` atrybutów.
+Poni¿ej zamieszczone zosta³y statystyki dla wybranych zmiennych.
+
+Pierwsze atrybuty zbioru zawieraj¹ informacje o identyfikatorze pliku PDB, nazwie ligandu oraz umiejscowieniu cz¹steczki w bia³ku. Ta grupa zmiennych s³u¿y do identyfikacji opisanych w wierszach cz¹steczek chemicznych. Zmienne te s¹ typu znakowego.
+
+```{r echo=FALSE}
+knitr::kable(t(sapply(protein[,2:7],summary)))
+```
+
+Poni¿sza tabela przedstawia podsumowanie zmiennych informuj¹cych o liczbie atomów i elektronów ligandu zamodelowanych w pliku PDB (_local_) oraz wyliczonych na podstawie danych s³ownikowych (“tablicy pierwiastków”) (_dict_).
+
+```{r echo=FALSE}
+knitr::kable(t(sapply(protein[,12:20],summary)))
+knitr::kable(t(sapply(protein[,21:26],summary)))
+```
+
+Kolejna grupa atrybutów opisuje wartoœci obliczone tylko na podstawie ligandu. Liczba pojawiaj¹ca siê po “part_” koduje próg odciêcia intensywnoœci. Dla ka¿dego progu odciêcia wystêpuj¹ te same atrybuty, a w tabeli poni¿ej przedstawione zosta³y przyk³adowe atrybuty dla odciêcia part_01.
+
+```{r echo=FALSE}
+part_stat <- data.frame(protein$part_01_shape_CI, protein$part_01_density_O3, protein$part_01_density_E2_E1, protein$part_01_density_sqrt_E1, protein$part_01_density_I6, protein$part_01_density_M000, protein$part_01_density_FL, protein$part_01_density_FL_norm)
+knitr::kable(t(sapply(part_stat,summary)))
+```
+
+W zbiorze wysêpuj¹ zmienne, które maj¹ w nazwie _norm_ lub _sqrt_. S¹ to wartoœci obliczone z istniej¹cych ju¿ w zbiorze wartoœci, prezentuj¹ wiêc te same informacje. Aby nie dublowaæ tych samych wartoœci, kolumny te zosta³y wykluczone z obliczania regresji i klasyfikatora.
+
+```{r preparing, echo=FALSE}
+top50_protein<- as.data.frame(table(protein$res_name)) %>% arrange(desc(Freq)) %>% head(50)
+colnames(top50_protein) <- c("res_name", "Iloœæ w zbiorze")
+protein <-  subset(protein, res_name %in% top50_protein$res_name)
+```
+
+# Przygotowanie danych 
+
+Jak widaæ na powy¿szym podsumowaniu, w danych znajduje siê wiele pustych wartoœci. Wartoœci NA wystêpowa³y miêdzy innymi na atrybutach potencjalne wa¿nych dla póŸniejszej analizy, wobec czego dane te nale¿a³o uzupe³niæ. Zosta³o to dokonane w nastêpuj¹cy sposób: przed analiz¹ wybranego zbioru danych, wartoœci NA z tego zbioru zosta³y uzupe³niane œredni¹ danej wartoœci dla danej klasy _res_name_.
+
+#Sprawdzenie korelacji miêdzy zmiennymi
+
+Ze wglêdu na zbyt duz¹ iloœæ kolumn w zbiorze zrezygnowano ze sprawdzenia korelacji wszystkich par zmiennych. Przedstawienie takiego zestawienia by³oby nieczytelne oraz kosztowne obliczeniowo. 
+
+W raporcie zosta³a wiêc przedstawiona korelacja jedynie kolumn prezentuj¹cych atrybuty dla odciêcia poziomu 1. S¹ to kolumny, których wartoœci obliczone zosta³y tylko na podstawie ligandu, warto jest wiêc zapoznaæ siê z ich wzajemnymi zale¿noœciami. 
+
+Z zakresu danych zosta³y odjête zmienne zawieraj¹ce w nazwie _norm_ i _sqrt_. Dane te s¹ silnie skorelowane ze zmiennymi na bazie których powsta³y, wiêc dodawanie ich do wykresu zmniejszy³oby jego czytelnoœæ.
+
+```{r echo=FALSE,fig.width=20,fig.height=15}
+part_01 <- select(protein, res_name, starts_with("part_01"), -(matches("*norm*")), -(matches("*sqrt*")), -matches("*_Z_*")) %>% group_by(res_name)
+part_01 <- part_01 %>%
+   mutate_all(funs(ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+part_01 <- ungroup(part_01, res_name)
+part_01 <- select(part_01, -(res_name))
+part_01_cor <- cor(part_01)
+corrplot(part_01_cor, method="color",type="upper",order="hclust",tl.col="black")
+```
+
+#Iloœæ przyk³adów dla ka¿dej z klas
+
+Na ka¿d¹ z klas przypada nastêpuj¹ca liczba przyk³adów:
+
+```{r echo=FALSE, fig.align="center",fig.height=8}
+grid.arrange(tableGrob(top50_protein[1:25,]), tableGrob(top50_protein[26:50,]), ncol = 2)
+```
+
+#Rozk³ad liczby atomów i elektronów
+```{r plots1, fig.width=7, fig.height = 6, echo=FALSE}
+ggplot(protein, aes(x=local_res_atom_non_h_count)) + geom_histogram(bins = 9,colour="black") + ggtitle("Rozk³ad liczby atomów") + theme_bw()
+
+ggplot(protein, aes(x=local_res_atom_non_h_electron_sum)) + geom_histogram(bins = 9,colour="black") + ggtitle("Rozk³ad liczby elektronów") + theme_bw()
+```
+
+Na podstawie powy¿szych histogramów nie mo¿na kategorycznie stwierdziæ, ¿e iloœæ elektronów jest wprost proporcjonalna do iloœci atomów, gdy¿ jak wiadomo, iloœæ elektronów w atomie jest zale¿na równie¿ od masy atomowej danego pierwiastka. Ni¿sza wartoœæ w pierwszym pojemniku histogramu rozk³adu liczby elektronów wynika z faktu, ¿e pierwiastki wchodz¹ce w sk³ad ligandu mog¹ mieæ mniejsz¹ masê atomow¹ (iloœæ elektronów = liczba protonów w atomie danego pierwiastka).
+
+Poni¿ej interaktywny wykresy œredniej liczby atomów i elektronów dla piêædziesiêciu najlpopularniejszych klas _res_name_:
+
+```{r plots2, fig.width=7, fig.height = 6, echo=FALSE}
+plot_data <- protein %>% group_by(res_name) %>% summarise(local_res_atom_non_h_count = mean(local_res_atom_non_h_count), local_res_atom_non_h_electron_sum = mean(local_res_atom_non_h_electron_sum))
+
+plot_ly(plot_data, x = ~res_name, y = ~local_res_atom_non_h_count, type = 'bar', name = 'local_res_atom_non_h_count') %>% layout(yaxis = list(title = 'Mean of local_res_atom_non_h_count'))
+
+plot_ly(plot_data, x = ~res_name, y = ~local_res_atom_non_h_electron_sum, type = 'bar', name = 'local_res_atom_non_h_electron_sum') %>% layout(yaxis = list(title = 'Mean of local_res_atom_non_h_electron_sum'))
+```
+
+#Klasy charakteryzuj¹ce siê najwiêksz¹ niezgodnoœci¹ liczby atomów
+
+```{r echo=FALSE}
+diff_atoms <- protein %>% mutate(diff = abs(local_res_atom_non_h_count - dict_atom_non_h_count)) %>% group_by(res_name) %>% summarize("Srednia" = mean(diff), "Minimum" = min(diff), "Maksimum"=max(diff))
+```
+
+Najwiêksza maksymalna niezgodnoœæ liczby atomów zosta³a osi¹gniêta dla nastêpuj¹cych klas:
+
+```{r echo=FALSE}
+knitr::kable(diff_atoms %>% arrange(desc(Maksimum)) %>% select(res_name, Maksimum) %>% head(10))
+```
+
+Z kolei nastêpuj¹ce klasy osi¹gnê³y najwiêksz¹ œredni¹ niezgodnoœæ liczby atomów:
+
+```{r echo=FALSE}
+knitr::kable(diff_atoms %>% arrange(desc(Srednia)) %>% select(res_name, Srednia) %>% head(10))
+```
+
+#Klasy charakteryzuj¹ce siê najwiêksz¹ niezgodnoœci¹ liczby elektronów
+
+```{r echo=FALSE}
+diff_electrons <- protein %>% mutate(diff = abs(local_res_atom_non_h_electron_sum - dict_atom_non_h_electron_sum)) %>% group_by(res_name) %>% summarize("Srednia" = round(mean(diff)), "Minimum" = min(diff), "Maksimum"=max(diff))
+```
+
+Najwiêksza maksymalna niezgodnoœæ liczby elektronów zosta³a osi¹gniêta dla nastêpuj¹cych klas:
+
+```{r echo=FALSE}
+knitr::kable(diff_electrons %>% arrange(desc(Maksimum)) %>% select(res_name, Maksimum) %>% head(10))
+```
+
+Z kolei nastêpuj¹ce klasy osi¹gnê³y najwiêksz¹ œredni¹ niezgodnoœæ liczby elektronów:
+
+```{r echo=FALSE}
+knitr::kable(diff_electrons %>% arrange(desc(Srednia)) %>% select(res_name, Srednia) %>% head(10))
+```
+
+#Rozk³ad wartoœci kolumn zaczynaj¹cych siê od part_01
+
+W tej sekcji zobrazowano rozk³ady wartoœci kolumn nale¿¹cych do pierwszego odciêcia.
+
+Jak ³atwo zauwa¿yæ, dla wielu z kolumn wartoœci w zbiorze danych skupione s¹ w okolicy zera za wyj¹tkiem pewnych, nieraz daleko oddalonych ekstremów. Mo¿liwe, ¿e obecnoœæ takich ekstremów jest charakterystyczna dla okreœlonych klas ligandów, co mog³o by wspomóc dalsz¹ analizê i klasyfikacjê.
+
+```{r echo=FALSE,warning=FALSE,error=FALSE}
+part_01 <- select(protein, starts_with("part_01"))
+for (i in seq(from=1, to=ncol(part_01), by=2)){
+  mean1 <- mean(part_01[[i]], na.rm = TRUE)
+  mean2 <- mean(part_01[[i + 1]], na.rm = TRUE)
+  plot1 <- ggplot(part_01, aes(x=part_01[[i]])) + geom_density() + labs(x=colnames(part_01)[i]) + geom_vline(xintercept= mean1, color="blue") + theme_bw()
+  plot2 <- ggplot(part_01, aes(x=part_01[[i+1]])) + geom_density() + labs(x=colnames(part_01)[i+1]) + geom_vline(xintercept= mean2, color="blue") + theme_bw()
+  grid.arrange(plot1, plot2, ncol = 2, as.table = FALSE)
+}
+```
+
+#Przewidywanie liczby elektronów i atomów na podstawie innych kolumn
+
+Jako model zosta³ u¿yty schemat _10-fold cross-validation + holdout_. Polega on na podzieleniu zbioru na dwa zbiory: ucz¹cy (80% próbek) oraz testowy (20% próbek), a nastêpnie podzielenie zbioru ucz¹cego wg. powtórzonej walidacji krzy¿owej. Zbiór ten dzielony jest na 10 podzbiorów. Nastêpnie nastêpuje 10 tur analizy, podczas której ka¿dy z podzbiorów w swojej turze staje siê zbiorem waliduj¹cym, a pozosta³e - ucz¹cym. Dodatkowo dokonano optymalizacji parametrów - zastosowano dodatkowe skalowanie i centrowanie danych. Jako algorytm wybrano regresjê liniow¹.
+
+Do regresji zosta³y u¿yte nastêpuj¹ce grupy zmiennych:
+ * zmienne informuj¹ce o liczbie atomów i elektronów ligandu zamodelowanych w pliku PDB (_local_) oraz wyliczone na podstawie danych s³ownikowych (“tablicy pierwiastków”) (_dict_),
+ * wartoœci obliczone na podstawie ligandu dla odciêcia part_01 bez zmiennych _sqrt_ i _norm_.
+
+```{r dataPartition,echo=FALSE,warning=FALSE,error=FALSE}
+dataPartition <- select(protein, res_name, starts_with("local_res"), starts_with("dict"), starts_with("part_01"), -(matches("*norm*")), -(matches("*sqrt*")), -matches("*_Z_*")) %>% group_by(res_name)
+dataPartition <- dataPartition %>%
+   mutate_all(funs(ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+dataPartition <- ungroup(dataPartition, res_name)
+dataPartition <- select(dataPartition, -(res_name))
+
+inTraining <- createDataPartition(y = dataPartition$local_res_atom_non_h_electron_sum, p = .8, list = FALSE)
+trainingSet <- dataPartition[inTraining, ]
+testingSet <- dataPartition[-inTraining, ]
+ctrl <- trainControl(method = "repeatedcv", number = 10, preProcOptions = c("center", "scale"))
+fit_lm <- train(local_res_atom_non_h_electron_sum ~ ., data = trainingSet, method = "lm", trControl = ctrl)
+
+rmse_results <- c("LM_RMSE" = min(fit_lm$results$RMSE), "LM_R^2" = min(fit_lm$results$Rsquared))
+knitr::kable(rmse_results, col.names = c("Wyniki dla przewidywania liczby elektronów"))
+
+imp <- varImp(fit_lm)$importance
+knitr::kable(head(imp[order(-imp$Overall), , drop = FALSE],10))
+
+inTraining <- createDataPartition(y = dataPartition$local_res_atom_non_h_count, p = .8, list = FALSE)
+trainingSet <- dataPartition[inTraining, ]
+testingSet <- dataPartition[-inTraining, ]
+ctrl <- trainControl(method = "repeatedcv", number = 10, preProcOptions = c("center", "scale"))
+fit_lm <- train(local_res_atom_non_h_count ~ ., data = trainingSet, method = "lm", trControl = ctrl)
+
+rmse_results <- c("LM_RMSE" = min(fit_lm$results$RMSE), "LM_R^2" = min(fit_lm$results$Rsquared))
+knitr::kable(rmse_results, col.names = c("Wyniki dla przewidywania liczby atomów"))
+
+imp <- varImp(fit_lm)$importance
+knitr::kable(head(imp[order(-imp$Overall), , drop = FALSE],10))
+```
+Zarówno wyniki dla przewidywania liczby elektronów jak i przewidywania liczby atomów wygl¹daj¹ zadowalaj¹co. Wynika to z obecnoœci s³ownikowych wartoœci liczby elektronów i atomów w zbiorze danych. Powy¿sza tabela pokazuje, i¿ reszta zmiennych w regresji nie by³y zbyt istotne.
+
+#Klasyfikator przewiduj¹cy wartoœæ atrybutu res_name
+
+Do klasyfikacji zosta³y u¿yte wartoœci obliczone na podstawie ligandu dla odciêcia part_01 bez zmiennych _sqrt_ i _norm_. Jako model zosta³ u¿yty schemat taki sam jak w przypadku regresji. U¿yty algorytm klasyfikacji to support vector machine (SAV), który uwa¿any jest za jeden z najszybciej dzia³aj¹cych klasyfikatorów.
+
+```{r echo=FALSE,warning=FALSE,error=FALSE}
+dataPartition <- select(protein, res_name,starts_with("part_01"), -(matches("*norm*")), -(matches("*sqrt*")), -matches("*_Z_*")) %>% group_by(res_name)
+dataPartition <- dataPartition %>%
+   mutate_all(funs(ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+dataPartition <- ungroup(dataPartition, res_name)
+
+inTraining <- createDataPartition(y = dataPartition$res_name, p = .8, list = FALSE)
+trainingSet <- dataPartition[inTraining, ]
+testingSet <- dataPartition[-inTraining, ]
+ctrl <- trainControl(method = "repeatedcv", number = 10, preProcOptions = c("center", "scale"))
+fit_svm <- train(res_name ~ ., data = trainingSet, method = "svmLinear", trControl = ctrl)
+
+svmClasses <- predict(fit_svm, newdata = testingSet)
+cm <- confusionMatrix(table(svmClasses, testingSet$res_name))
+knitr::kable(cm$overall[1])
+
+```
+
+Precyzja klasyfikacji wynosi oko³o 38 procent. Nie jest to zbyt zadowalaj¹cy wynik. U¿ycie innej odmiany SVM (np. radial kernel) oraz regulacja parametrów algortymu z pewnoœci¹ poprawi³oby trafnoœæ klasyfikacji.
